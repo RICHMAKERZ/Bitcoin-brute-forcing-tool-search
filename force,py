@@ -1,0 +1,105 @@
+import os
+import time
+import multiprocessing
+from tqdm import tqdm
+import base58
+import bech32
+import ecdsa
+from hashlib import sha256, new as hashlib_new
+
+# Constants
+PRIVATE_KEY_RANGE_START = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
+PRIVATE_KEY_RANGE_END = 0x79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798
+
+def load_targets(file_path):
+    """Load valid target addresses from challenge.txt"""
+    try:
+        with open(file_path, 'r') as file:
+            targets = set(line.strip() for line in file if line.strip())
+        return targets
+    except FileNotFoundError:
+        print(f"Error: File {file_path} not found.")
+        return set()
+
+def save_results(file_path, found_data):
+    """Save found addresses and private keys to I_win.txt"""
+    try:
+        with open(file_path, 'a') as file:
+            for address, private_key in found_data:
+                file.write(f"Address: {address}, Private Key: {private_key}\n")
+    except Exception as e:
+        print(f"Error writing to file {file_path}: {e}")
+
+def derive_address(private_key_hex):
+    """Derive a Bitcoin address from a private key (supports P2PKH, P2SH, and Bech32)"""
+    try:
+        # Derive public key
+        private_key_bytes = bytes.fromhex(private_key_hex)
+        sk = ecdsa.SigningKey.from_string(private_key_bytes, curve=ecdsa.SECP256k1)
+        vk = sk.verifying_key
+        public_key = b'\x04' + vk.to_string()
+
+        # Hash public key
+        sha256_hash = sha256(public_key).digest()
+        ripemd160_hash = hashlib_new('ripemd160', sha256_hash).digest()
+
+        # P2PKH address
+        p2pkh_address = base58.b58encode_check(b'\x00' + ripemd160_hash).decode()
+
+        # Bech32 address (SegWit)
+        bech32_address = bech32.encode('bc', 0, ripemd160_hash)
+
+        return p2pkh_address, bech32_address
+    except Exception as e:
+        print(f"Error deriving address: {e}")
+        return None, None
+
+def brute_force_worker(start, end, targets, result_queue):
+    """Worker function for multiprocessing"""
+    for private_key_int in range(start, end):
+        private_key_hex = hex(private_key_int)[2:].zfill(64)
+        p2pkh_address, bech32_address = derive_address(private_key_hex)
+        if p2pkh_address in targets or bech32_address in targets:
+            result_queue.put((p2pkh_address, private_key_hex))
+            result_queue.put((bech32_address, private_key_hex))
+
+def brute_force(targets):
+    """Optimized brute force algorithm with multiprocessing"""
+    num_processes = multiprocessing.cpu_count()
+    chunk_size = (PRIVATE_KEY_RANGE_END - PRIVATE_KEY_RANGE_START) // num_processes
+    result_queue = multiprocessing.Queue()
+    processes = []
+
+    for i in range(num_processes):
+        start = PRIVATE_KEY_RANGE_START + i * chunk_size
+        end = start + chunk_size if i < num_processes - 1 else PRIVATE_KEY_RANGE_END
+        process = multiprocessing.Process(
+            target=brute_force_worker,
+            args=(start, end, targets, result_queue)
+        )
+        processes.append(process)
+        process.start()
+
+    found_data = []
+    with tqdm(total=PRIVATE_KEY_RANGE_END - PRIVATE_KEY_RANGE_START, desc="Searching") as pbar:
+        while any(process.is_alive() for process in processes):
+            while not result_queue.empty():
+                found_data.append(result_queue.get())
+                pbar.update(1)
+
+    for process in processes:
+        process.join()
+
+    return found_data
+
+if __name__ == '__main__':
+    targets = load_targets('challenge.txt')
+    if not targets:
+        print("No valid targets loaded. Exiting.")
+    else:
+        print("Starting optimized search for Bitcoin private keys...")
+        start_time = time.time()
+        found_data = brute_force(targets)
+        end_time = time.time()
+        save_results('I_win.txt', found_data)
+        print(f"Search completed! Time Taken: {end_time - start_time:.2f} seconds")
